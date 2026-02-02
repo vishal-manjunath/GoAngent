@@ -61,21 +61,38 @@ func (f *BundleFactory) CreateBundle(logs []RawLog, patterns []string) *Correlat
 // ===================== CONFIG & STATS =====================
 //
 
+type FlushReason string
+
+const (
+	FlushErrorDetected FlushReason = "error_detected"
+	FlushTimeElapsed   FlushReason = "time_elapsed"
+	FlushManual        FlushReason = "manual"
+	FlushBufferFull    FlushReason = "buffer_full"
+	FlushShutdown      FlushReason = "shutdown"
+	FlushExpired	   FlushReason = "expired"
+)
+
 type StreamConfig struct {
-	MaxLogsPerSecond     int
-	MaxBufferSize        int
-	MaxTokensPerRun      int
-	MaxStreamDurationMin float64
-	MinStreamDurationMin float64
+	MaxLogsPerSecond       int
+	MaxBufferSize          int
+	MaxTokensPerRun        int
+	MaxStreamDurationMin   float64
+	MinStreamDurationMin   float64
+	WindowSeconds          int
+	FlushIntervalSeconds   int
+	ErrorTriggersImmediate bool
 }
 
 func DefaultStreamConfig() StreamConfig {
 	return StreamConfig{
-		MaxLogsPerSecond:     50,
-		MaxBufferSize:        50,
-		MaxTokensPerRun:      6000,
-		MaxStreamDurationMin: 60,
-		MinStreamDurationMin: 15,
+		MaxLogsPerSecond:       50,
+		MaxBufferSize:          10,
+		MaxTokensPerRun:        6000,
+		MaxStreamDurationMin:   0.5,
+		MinStreamDurationMin:   15,
+		WindowSeconds:          60,
+		FlushIntervalSeconds:   30,
+		ErrorTriggersImmediate: true,
 	}
 }
 
@@ -100,31 +117,63 @@ type StreamManager struct {
 	checkWindowStart time.Time
 	logsInWindow     int
 
-	// SSE subscribers
+	lastFlushTime time.Time
+	stopChan      chan struct{}
+
 	subscribers map[chan *CorrelationBundle]struct{}
-	mu          sync.Mutex
+
+	mu sync.Mutex
 }
 
 func NewStreamManager(config StreamConfig) *StreamManager {
-	return &StreamManager{
+	sm := &StreamManager{
 		Config:           config,
 		Buffer:           []RawLog{},
 		Stats:            StreamStats{StartTime: time.Now()},
 		Preprocessor:     NewLogPreprocessor(),
 		checkWindowStart: time.Now(),
 		logsInWindow:     0,
+		lastFlushTime:    time.Now(),
+		stopChan:         make(chan struct{}),
 		subscribers:      make(map[chan *CorrelationBundle]struct{}),
 	}
+
+	go sm.backgroundFlushLoop()
+	return sm
+}
+
+//
+// ===================== WINDOW PRUNING =====================
+//
+
+func (s *StreamManager) pruneOldLogs() {
+	cutoff := time.Now().Add(-time.Duration(s.Config.WindowSeconds) * time.Second)
+
+	pruned := s.Buffer[:0]
+	for _, log := range s.Buffer {
+		if ts, ok := log.Data["timestamp"].(time.Time); ok {
+			if ts.After(cutoff) {
+				pruned = append(pruned, log)
+			}
+		} else {
+			// keep log if timestamp missing
+			pruned = append(pruned, log)
+		}
+	}
+	s.Buffer = pruned
 }
 
 //
 // ===================== INGEST =====================
 //
 
-func (s *StreamManager) Ingest(logDict map[string]interface{}) bool {
+// In stream_manager.go: Replace the existing Ingest function
+func (s *StreamManager) Ingest(logDict map[string]interface{}) (bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.IsExpired() {
-		return false
+		return false, false
 	}
 
 	now := time.Now()
@@ -135,20 +184,31 @@ func (s *StreamManager) Ingest(logDict map[string]interface{}) bool {
 
 	if s.logsInWindow >= s.Config.MaxLogsPerSecond {
 		s.Stats.DroppedLogs++
-		return false
+		return false, false
 	}
 
 	parsed, err := s.Preprocessor.Parser.ParseLogs([]map[string]interface{}{logDict})
 	if err != nil {
 		s.Stats.DroppedLogs++
-		return false
+		return false, false
 	}
+
+	// sliding window prune
+	s.pruneOldLogs()
 
 	s.Buffer = append(s.Buffer, parsed[0])
 	s.logsInWindow++
 	s.Stats.TotalLogsIngested++
 
-	return true
+	// Check if this specific log is an error
+	isError := false
+	if s.Config.ErrorTriggersImmediate {
+		if lvl, ok := logDict["level"].(string); ok && lvl == "ERROR" {
+			isError = true
+		}
+	}
+
+	return true, isError
 }
 
 func (s *StreamManager) ShouldFlush() bool {
@@ -161,42 +221,69 @@ func (s *StreamManager) IsExpired() bool {
 }
 
 //
+// ===================== BACKGROUND FLUSH =====================
+//
+
+func (s *StreamManager) backgroundFlushLoop() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		case <-ticker.C:
+			// Check for expiration first
+			if s.IsExpired() {
+				s.FlushWithReason(FlushExpired)
+				// You might want to shut down or signal the manager is done here
+				return 
+			}
+			if time.Since(s.lastFlushTime).Seconds() >= float64(s.Config.FlushIntervalSeconds) {
+				s.FlushWithReason(FlushTimeElapsed)
+			}
+		}
+	}
+}
+
+//
 // ===================== FLUSH =====================
 //
 
-func (s *StreamManager) Flush() *CorrelationBundle {
+func (s *StreamManager) FlushWithReason(reason FlushReason) *CorrelationBundle {
+	s.mu.Lock()
 
 	if len(s.Buffer) == 0 {
+		s.mu.Unlock()
 		return nil
 	}
 
-	// ✅ REAL pattern derivation (no placeholder)
 	patterns := deriveStreamPatterns(s.Buffer)
-
 	bundle := s.Preprocessor.Factory.CreateBundle(s.Buffer, patterns)
 
+	bundle.Metadata["flush_reason"] = string(reason)
+	bundle.Metadata["flushed_at"] = time.Now().UTC().Format(time.RFC3339)
+
 	estimatedTokens := s.estimateTokens(bundle)
-
 	bundle.Metadata["original_token_est"] = estimatedTokens
-	bundle.Metadata["truncated"] = false
-
-	if estimatedTokens > s.Config.MaxTokensPerRun {
-		ratio := float64(s.Config.MaxTokensPerRun) / float64(estimatedTokens)
-		newLen := int(float64(len(bundle.Sequence)) * ratio * 0.9)
-		if newLen < 0 {
-			newLen = 0
-		}
-		bundle.Sequence = bundle.Sequence[:newLen]
-		// bundle.Metadata["truncated"] = true
-		bundle.Metadata["original_token_est"] = estimatedTokens
-	}
 
 	s.Buffer = []RawLog{}
 	s.Stats.BufferFlushCount++
+	s.lastFlushTime = time.Now()
+
+	s.mu.Unlock() // 🔓 unlock BEFORE publish
 
 	s.publish(bundle)
-
 	return bundle
+}
+
+func (s *StreamManager) Flush() *CorrelationBundle {
+	return s.FlushWithReason(FlushManual)
+}
+
+func (s *StreamManager) Shutdown() {
+	close(s.stopChan)
+	s.FlushWithReason(FlushShutdown)
 }
 
 func (s *StreamManager) estimateTokens(bundle *CorrelationBundle) int {
@@ -238,7 +325,6 @@ func (s *StreamManager) publish(bundle *CorrelationBundle) {
 // ===================== PATTERN DERIVATION =====================
 //
 
-// ✅ Lightweight, generic, non-hardcoded
 func deriveStreamPatterns(logs []RawLog) []string {
 	unique := make(map[string]struct{})
 
@@ -252,6 +338,5 @@ func deriveStreamPatterns(logs []RawLog) []string {
 	for msg := range unique {
 		patterns = append(patterns, msg)
 	}
-
 	return patterns
 }

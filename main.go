@@ -68,7 +68,8 @@ var allowedPrefixes = []string{
 // ================= STREAM MANAGER =================
 //
 
-var streamMgr = NewStreamManager(DefaultStreamConfig())
+// var streamMgr = NewStreamManager(DefaultStreamConfig())
+var streamMgr *StreamManager
 
 //
 // ================= STREAM STATUS =================
@@ -83,6 +84,52 @@ type StreamStatus struct {
 }
 
 var currentStream = &StreamStatus{}
+
+// ================= FOLDER LOG BUFFER =================
+
+var folderLogBuffer = struct {
+	sync.Mutex
+	Logs []map[string]interface{}
+}{}
+
+func addToFolderBuffer(log map[string]interface{}) {
+	folderLogBuffer.Lock()
+	folderLogBuffer.Logs = append(folderLogBuffer.Logs, log)
+	folderLogBuffer.Unlock()
+
+	// ✅ NEW: immediately push to connected users
+	broadcastFolderLog(log)
+}
+
+func readFolderBuffer() []map[string]interface{} {
+	folderLogBuffer.Lock()
+	defer folderLogBuffer.Unlock()
+	cp := make([]map[string]interface{}, len(folderLogBuffer.Logs))
+	copy(cp, folderLogBuffer.Logs)
+	return cp
+}
+
+func clearFolderBuffer() {
+	folderLogBuffer.Lock()
+	defer folderLogBuffer.Unlock()
+	folderLogBuffer.Logs = nil
+}
+
+// ================= FOLDER STREAM BROADCAST =================
+
+var folderClients = make(map[chan map[string]interface{}]bool)
+var folderClientsMu sync.Mutex
+
+func broadcastFolderLog(log map[string]interface{}) {
+	folderClientsMu.Lock()
+	for ch := range folderClients {
+		select {
+		case ch <- log:
+		default:
+		}
+	}
+	folderClientsMu.Unlock()
+}
 
 //
 // ================= OUTPUT SCHEMA =================
@@ -122,6 +169,65 @@ func readFileAutoUTF(path string) (string, error) {
 	}
 
 	return string(data), nil
+}
+
+func readLastNLines(path string, n int) ([]string, error) {
+	data, err := readFileAutoUTF(path)
+	if err != nil {
+		return nil, err
+	}
+
+	data = strings.ReplaceAll(data, "\r\n", "\n")
+	lines := strings.Split(data, "\n")
+
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+
+	var out []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return out, nil
+}
+
+// ================= FOLDER LIVE TAIL =================
+
+func tailFileContinuously(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Println("[OPSCURE] tail open error:", err)
+		return
+	}
+	defer f.Close()
+
+	f.Seek(0, io.SeekEnd)
+	reader := bufio.NewReader(f)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		addToFolderBuffer(map[string]interface{}{
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"level":     "INFO",
+			"service":   filepath.Base(path),
+			"message":   line,
+			"file":      path,
+			"folder":    filepath.Dir(path),
+		})
+	}
 }
 
 //
@@ -261,7 +367,13 @@ type StreamIngestRequest struct {
 	Logs []IncomingLog `json:"logs"`
 }
 
+// In main.go: Replace the existing streamIngestHandler function
 func streamIngestHandler(w http.ResponseWriter, r *http.Request) {
+	if streamMgr == nil {
+		http.Error(w, "agent warming up, retry in 1s", 503)
+		return
+	}
+
 	var req StreamIngestRequest
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -275,6 +387,7 @@ func streamIngestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accepted := 0
+	errorTriggered := false
 
 	for _, l := range req.Logs {
 		raw := strings.TrimSpace(l.Raw)
@@ -286,15 +399,37 @@ func streamIngestHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log := parseRawLogLine(raw, l.Severity)
-		if streamMgr.Ingest(log) {
+		
+		// Capture both the acceptance and the error trigger status
+		ok, isErr := streamMgr.Ingest(log)
+		if ok {
 			accepted++
+			if isErr {
+				errorTriggered = true
+			}
+		} else {
+			// If not accepted, check if it's because of expiration
+			if streamMgr.IsExpired() {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden) // 403 or 410 Gone
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": "stream_expired",
+					"reason": "The manager has exceeded its MaxStreamDurationMin",
+				})
+				return
+			}
 		}
 	}
 
 	var bundle *CorrelationBundle
 	flushed := false
-	if streamMgr.ShouldFlush() {
-		bundle = streamMgr.Flush()
+
+	// Flush immediately if an ERROR was found OR if buffer limit reached
+	if errorTriggered {
+		bundle = streamMgr.FlushWithReason(FlushErrorDetected)
+		flushed = bundle != nil
+	} else if streamMgr.ShouldFlush() {
+		bundle = streamMgr.FlushWithReason(FlushBufferFull)
 		flushed = bundle != nil
 	}
 
@@ -303,7 +438,7 @@ func streamIngestHandler(w http.ResponseWriter, r *http.Request) {
 		"received": len(req.Logs),
 		"accepted": accepted,
 		"flushed":  flushed,
-		"bundle":   bundle,
+		"bundle":   bundle, // This will now contain data when an error is sent
 	})
 }
 
@@ -634,6 +769,98 @@ func streamPipe(r io.ReadCloser) {
 // ================= OTHER HANDLERS (UNCHANGED) =================
 //
 
+func folderLogsHandler(w http.ResponseWriter, r *http.Request) {
+
+	raw := r.URL.Query().Get("paths")
+	if raw == "" {
+		http.Error(w, "paths are required", 400)
+		return
+	}
+
+	folders := strings.Split(raw, "|")
+
+	clearFolderBuffer()
+
+	for _, f := range folders {
+		go startFolderLogMonitoring(strings.TrimSpace(f))
+	}
+
+	// small warm-up
+	time.Sleep(50 * time.Millisecond)
+
+	logs := readFolderBuffer()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"folders": folders,
+		// "files":  len(discoverWorkspaceLogs(folders)),
+		"logs":   logs,
+	})
+}
+
+func folderLogsStreamHandler(w http.ResponseWriter, r *http.Request) {
+
+	raw := r.URL.Query().Get("paths")
+	if raw == "" {
+		http.Error(w, "paths are required", 400)
+		return
+	}
+
+	folders := strings.Split(raw, "|")
+
+	clearFolderBuffer()
+
+	for _, f := range folders {
+		go startFolderLogMonitoring(strings.TrimSpace(f))
+	}
+
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ch := make(chan map[string]interface{}, 20)
+
+	// register client
+	folderClientsMu.Lock()
+	folderClients[ch] = true
+	folderClientsMu.Unlock()
+
+	// remove on disconnect
+	defer func() {
+		folderClientsMu.Lock()
+		delete(folderClients, ch)
+		folderClientsMu.Unlock()
+		close(ch)
+		fmt.Println("[OPSCURE] folder stream closed")
+	}()
+
+	// send already collected logs first
+	for _, l := range readFolderBuffer() {
+		b, _ := json.Marshal(l)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		flusher.Flush()
+	}
+
+	// keep streaming new logs
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case log := <-ch:
+			b, _ := json.Marshal(log)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+		}
+	}
+}
+
 func logsHandler(w http.ResponseWriter, r *http.Request) {
 	app := r.URL.Query().Get("app")
 	key := r.URL.Query().Get("log")
@@ -668,6 +895,11 @@ func streamStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func streamLiveHandler(w http.ResponseWriter, r *http.Request) {
+	if streamMgr == nil {
+		http.Error(w, "agent warming up, retry in 1s", 503)
+		return
+	}
+	
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 
@@ -961,16 +1193,33 @@ func toStringSlice(src interface{}) []string {
 }
 
 func listenWithAutoPort(addr string) (net.Listener, string, error) {
-	// 1. Try requested port first (8080)
+
+	host := "127.0.0.1"
+
+	// most-users-free ports
+	ports := []string{"5173", "3000", "5000", "8000", "8080"}
+
+	// Try user provided addr first
 	ln, err := net.Listen("tcp", addr)
 	if err == nil {
 		return ln, ln.Addr().String(), nil
 	}
 
-	fmt.Println("[OPSCURE] 8080 busy → selecting free port")
+	fmt.Println("[OPSCURE] default addr busy → scanning common free ports")
 
-	// 2. Ask OS for free port
-	ln, err = net.Listen("tcp", "127.0.0.1:0")
+	// Try common free ports (very fast)
+	for _, p := range ports {
+		tryAddr := host + ":" + p
+		ln, err := net.Listen("tcp", tryAddr)
+		if err == nil {
+			fmt.Println("[OPSCURE] bound to free port:", p)
+			return ln, ln.Addr().String(), nil
+		}
+	}
+
+	// Fallback → OS picks a free port
+	fmt.Println("[OPSCURE] all common ports busy → asking OS for free port")
+	ln, err = net.Listen("tcp", host+":0")
 	if err != nil {
 		return nil, "", err
 	}
@@ -990,6 +1239,65 @@ func writeAgentPort(port string) {
 func branchExists(workspace, name string) bool {
 	_, err := runGitOutput(workspace, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+name)
 	return err == nil
+}
+
+// --- NEW: Global Log Discovery ---
+
+func discoverWorkspaceLogs(workspace string) []string {
+	var files []string
+
+	filepath.WalkDir(workspace, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		lower := strings.ToLower(d.Name())
+
+		if strings.HasSuffix(lower, ".log") ||
+			strings.HasSuffix(lower, ".out") ||
+			strings.HasSuffix(lower, ".txt") ||
+			strings.Contains(lower, "catalina") ||
+			strings.Contains(lower, "access") ||
+			strings.Contains(lower, "gc") {
+
+			files = append(files, path)
+		}
+
+		return nil
+	})
+
+	return files
+}
+
+func startFolderLogMonitoring(folder string) {
+
+	logFiles := discoverWorkspaceLogs(folder)
+
+	fmt.Println("[OPSCURE] Monitoring folder:", folder)
+
+	for _, file := range logFiles {
+
+		// send last 10 lines first
+		lastLines, err := readLastNLines(file, 10)
+		if err == nil {
+			for _, line := range lastLines {
+				addToFolderBuffer(map[string]interface{}{
+					"timestamp": time.Now().UTC().Format(time.RFC3339),
+					"level":     "INFO",
+					"service":   filepath.Base(file),
+					"message":   line,
+					"file":      file,
+					"folder":    filepath.Dir(file),
+				})
+			}
+		}
+
+		// start live tail
+		go tailFileContinuously(file)
+	}
 }
 
 //
@@ -1021,6 +1329,12 @@ func main() {
 	http.HandleFunc("/fix/apply", fixApplyHandler)
 	http.HandleFunc("/fix/stream", fixStreamHandler)
 	http.HandleFunc("/fix/rollback", fixRollbackHandler)
+	http.HandleFunc("/logs/folder/read", folderLogsHandler)
+	http.HandleFunc("/logs/folder/stream", folderLogsStreamHandler)
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	})
+
 
 	// AUTO PORT LOGIC
 	ln, actualAddr, err := listenWithAutoPort(*addr)
@@ -1033,9 +1347,24 @@ func main() {
 	// write port so VS Code extension can read
 	writeAgentPort(port)
 
-	fmt.Println("[OPSCURE] Agent running on", actualAddr)
+	fmt.Println("[OPSCURE] Agent starting on", actualAddr)
 
-	if err := http.Serve(ln, nil); err != nil {
-		panic(err)
-	}
+	// Start server immediately (non-blocking)
+	go func() {
+		if err := http.Serve(ln, nil); err != nil {
+			panic(err)
+		}
+	}()
+
+	fmt.Println("[OPSCURE] Agent READY on", actualAddr)
+	// 🚀 Heavy init in background (does NOT block startup)
+	go func() {
+		fmt.Println("[OPSCURE] Initializing stream manager...")
+		streamMgr = NewStreamManager(DefaultStreamConfig())
+		fmt.Println("[OPSCURE] Stream manager ready")
+	}()
+
+	// Block forever
+	select {}
+
 }
