@@ -66,13 +66,11 @@ func (p *LogParserGo) ParseLogs(rawData []map[string]interface{}) ([]RawLogGo, e
 
 	var parsed []RawLogGo
 	for _, entry := range rawData {
-		// Support "timestamp" key
 		ts := time.Now().UTC().Format(time.RFC3339)
 		if v, ok := entry["timestamp"].(string); ok && v != "" {
 			ts = v
 		}
 
-		// Support "severity" as used in your request body
 		level := "INFO"
 		if v, ok := entry["severity"].(string); ok {
 			level = strings.ToUpper(v)
@@ -82,7 +80,6 @@ func (p *LogParserGo) ParseLogs(rawData []map[string]interface{}) ([]RawLogGo, e
 
 		msg, _ := entry["message"].(string)
 
-		// Parse nested Source metadata
 		var meta LogMetadata
 		if src, ok := entry["source"].(map[string]interface{}); ok {
 			meta.Container, _ = src["container"].(string)
@@ -114,24 +111,12 @@ func (p *LogParserGo) ParseLogs(rawData []map[string]interface{}) ([]RawLogGo, e
 
 type LogPatternMinerGo struct{}
 
-// In log_preprocessor.go
-
-// NormalizeMessage applies the regex rules from the Bundle Builder Specification
 func (m *LogPatternMinerGo) NormalizeMessage(msg string) string {
 	result := msg
-
-	// 1. UUIDs
 	result = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`).ReplaceAllString(result, "<UUID>")
-
-	// 2. IP Addresses
 	result = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`).ReplaceAllString(result, "<IP>")
-
-	// 3. IDs (id=123, userId: abc)
 	result = regexp.MustCompile(`(?i)(id|user_?id|order_?id|session_?id)[=:\s]+[a-zA-Z0-9_-]+`).ReplaceAllString(result, "id=<ID>")
-
-	// 4. Large Numbers (6 or more digits, common for IDs/Timestamps)
 	result = regexp.MustCompile(`\b\d{6,}\b`).ReplaceAllString(result, "<NUM>")
-
 	return result
 }
 
@@ -148,7 +133,7 @@ func (m *LogPatternMinerGo) MinePatterns(logs []RawLogGo) []LogPatternGo {
 			p.LastOccurrence = log.Timestamp
 		} else {
 			patterns[key] = &LogPatternGo{
-				Pattern:         normalized, // Use normalized for Postman verification
+				Pattern:         normalized,
 				Count:           1,
 				FirstOccurrence: log.Timestamp,
 				LastOccurrence:  log.Timestamp,
@@ -180,7 +165,6 @@ func (f *BundleFactoryGo) CreateBundle(logs []RawLogGo, patterns []LogPatternGo,
 	errorCount := 0
 	for _, l := range logs {
 		if l.LogSource.Container != "" {
-			// Extract base service name from pod name (payment-service-7d4f8b -> payment-service)
 			base := regexp.MustCompile(`-[a-f0-9]+-[a-z0-9]+$`).ReplaceAllString(l.LogSource.Container, "")
 			serviceSet[base] = struct{}{}
 		}
