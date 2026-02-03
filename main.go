@@ -320,6 +320,9 @@ var springLogRegex = regexp.MustCompile(
 func parseRawLogLine(line, severity string) map[string]interface{} {
 	m := springLogRegex.FindStringSubmatch(line)
 
+	// default timestamp = now
+	ts := time.Now().UTC()
+
 	if len(m) == 0 {
 		svc := "unknown"
 
@@ -332,20 +335,21 @@ func parseRawLogLine(line, severity string) map[string]interface{} {
 		}
 
 		return map[string]interface{}{
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"timestamp": ts.Format(time.RFC3339),
 			"level":     severity,
 			"service":   svc,
 			"message":   strings.TrimSpace(line),
 		}
 	}
 
-	t, err := time.Parse("2006-01-02 15:04:05.000", m[1])
-	if err != nil {
-		t = time.Now().UTC()
+	// parsed Spring timestamp
+	parsedTs, err := time.Parse("2006-01-02 15:04:05.000", m[1])
+	if err == nil {
+		ts = parsedTs.UTC()
 	}
 
 	return map[string]interface{}{
-		"timestamp": t.UTC().Format(time.RFC3339),
+		"timestamp": ts.Format(time.RFC3339),
 		"level":     m[2],
 		"service":   m[3],
 		"message":   m[4],
@@ -357,14 +361,16 @@ func parseRawLogLine(line, severity string) map[string]interface{} {
 //
 
 type IncomingLog struct {
-	Severity  string `json:"severity"`
-	Timestamp string `json:"timestamp"`
-	Message   string `json:"message"`
-	Raw       string `json:"raw"`
+	Severity  string 				 `json:"severity"`
+	Timestamp string 				 `json:"timestamp"`
+	Message   string 				 `json:"message"`
+	Raw       string 				 `json:"raw"`
+	Source    map[string]interface{} `json:"source,omitempty"`
 }
 
 type StreamIngestRequest struct {
 	Logs []IncomingLog `json:"logs"`
+	Service string        `json:"service"`
 }
 
 // In main.go: Replace the existing streamIngestHandler function
@@ -399,6 +405,23 @@ func streamIngestHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log := parseRawLogLine(raw, l.Severity)
+
+		// ALWAYS prefer request timestamp if provided
+		if l.Timestamp != "" {
+			if ts, err := time.Parse(time.RFC3339, l.Timestamp); err == nil {
+				log["timestamp"] = ts.UTC().Format(time.RFC3339)
+			}
+		}
+
+
+		// preserve source if provided
+		if l.Source != nil {
+			log["source"] = l.Source
+		}
+
+		if req.Service != "" {
+			log["service"] = req.Service
+		}
 		
 		// Capture both the acceptance and the error trigger status
 		ok, isErr := streamMgr.Ingest(log)
@@ -411,10 +434,9 @@ func streamIngestHandler(w http.ResponseWriter, r *http.Request) {
 			// If not accepted, check if it's because of expiration
 			if streamMgr.IsExpired() {
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusForbidden) // 403 or 410 Gone
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				w.WriteHeader(http.StatusGone)
+				json.NewEncoder(w).Encode(map[string]string{
 					"error": "stream_expired",
-					"reason": "The manager has exceeded its MaxStreamDurationMin",
 				})
 				return
 			}
@@ -434,12 +456,21 @@ func streamIngestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"received": len(req.Logs),
-		"accepted": accepted,
-		"flushed":  flushed,
-		"bundle":   bundle, // This will now contain data when an error is sent
-	})
+	resp := StreamIngestResponse{
+		Accepted: accepted,
+	}
+
+	if flushed && bundle != nil {
+		resp.Status = "flushed"
+		reason := bundle.Metadata["flush_reason"].(string)
+		resp.FlushReason = &reason
+		resp.Bundle = bundle.Metadata["api_bundle"].(*StreamBundleResponse)
+	} else {
+		resp.Status = "buffering"
+	}
+
+	json.NewEncoder(w).Encode(resp)
+
 }
 
 type FixApplyRequest struct {
@@ -912,9 +943,16 @@ func streamLiveHandler(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case b := <-ch:
-			j, _ := json.Marshal(b)
-			fmt.Fprintf(w, "data: %s\n\n", j)
-			flusher.Flush()
+			if apiBundle, ok := b.Metadata["api_bundle"].(*StreamBundleResponse); ok {
+
+				payload := map[string]interface{}{
+					"bundle": apiBundle,
+				}
+
+				j, _ := json.Marshal(payload)
+				fmt.Fprintf(w, "data: %s\n\n", j)
+				flusher.Flush()
+			}
 		}
 	}
 }
@@ -968,6 +1006,38 @@ type AnalyzeMetrics struct {
 type PreprocessCombinedResponse struct {
 	PreprocessResponse AnalyzeResponse `json:"preprocess_response"`
 	AnalyzeResponse    json.RawMessage `json:"analyze_response"`
+}
+
+type StreamIngestResponse struct {
+	Status       string                 `json:"status"`
+	Accepted     int                    `json:"accepted"`
+	FlushReason  *string                `json:"flush_reason,omitempty"`
+	Bundle       *StreamBundleResponse  `json:"bundle,omitempty"`
+}
+
+type StreamBundleResponse struct {
+	ID               string                 `json:"id"`
+	WindowStart      string                 `json:"windowStart"`
+	WindowEnd        string                 `json:"windowEnd"`
+	RootService      string                 `json:"rootService"`
+	AffectedServices []string               `json:"affectedServices"`
+	LogPatterns      []StreamLogPattern     `json:"logPatterns"`
+	FlushMetadata    StreamFlushMetadata    `json:"flush_metadata"`
+}
+
+type StreamLogPattern struct {
+	Pattern          string                 `json:"pattern"`
+	Count            int                    `json:"count"`
+	FirstOccurrence  string                 `json:"firstOccurrence"`
+	LastOccurrence   string                 `json:"lastOccurrence"`
+	ErrorClass       string                 `json:"errorClass"`
+	LogSource        map[string]string      `json:"logSource"`
+}
+
+type StreamFlushMetadata struct {
+	Reason     string `json:"reason"`
+	LogCount   int    `json:"log_count"`
+	FlushedAt string `json:"flushed_at"`
 }
 
 func firstNonEmpty(list []string) string {
@@ -1357,7 +1427,7 @@ func main() {
 	}()
 
 	fmt.Println("[OPSCURE] Agent READY on", actualAddr)
-	// 🚀 Heavy init in background (does NOT block startup)
+	// Heavy init in background (does NOT block startup)
 	go func() {
 		fmt.Println("[OPSCURE] Initializing stream manager...")
 		streamMgr = NewStreamManager(DefaultStreamConfig())
