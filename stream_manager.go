@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"sync"
 	"time"
-	"regexp"
 )
 
 //
@@ -12,10 +11,7 @@ import (
 //
 
 type RawLog struct {
-	Data      map[string]interface{}
-	Timestamp time.Time
-	Level     string
-	Service   string
+	Data map[string]interface{}
 }
 
 type CorrelationBundle struct {
@@ -73,7 +69,7 @@ const (
 	FlushManual        FlushReason = "manual"
 	FlushBufferFull    FlushReason = "buffer_full"
 	FlushShutdown      FlushReason = "shutdown"
-	FlushExpired	   FlushReason = "expired"
+	FlushExpired       FlushReason = "expired"
 )
 
 type StreamConfig struct {
@@ -92,7 +88,7 @@ func DefaultStreamConfig() StreamConfig {
 		MaxLogsPerSecond:       50,
 		MaxBufferSize:          10,
 		MaxTokensPerRun:        6000,
-		MaxStreamDurationMin:   2,
+		MaxStreamDurationMin:   0.5,
 		MinStreamDurationMin:   15,
 		WindowSeconds:          60,
 		FlushIntervalSeconds:   30,
@@ -176,6 +172,10 @@ func (s *StreamManager) Ingest(logDict map[string]interface{}) (bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.IsExpired() {
+		return false, false
+	}
+
 	now := time.Now()
 	if now.Sub(s.checkWindowStart) >= time.Second {
 		s.checkWindowStart = now
@@ -187,24 +187,25 @@ func (s *StreamManager) Ingest(logDict map[string]interface{}) (bool, bool) {
 		return false, false
 	}
 
-	ts, _ := time.Parse(time.RFC3339, logDict["timestamp"].(string))
-
-	rl := RawLog{
-		Data:      logDict,
-		Timestamp: ts,
-		Level:     logDict["level"].(string),
-		Service:   logDict["service"].(string),
+	parsed, err := s.Preprocessor.Parser.ParseLogs([]map[string]interface{}{logDict})
+	if err != nil {
+		s.Stats.DroppedLogs++
+		return false, false
 	}
 
-	s.Buffer = append(s.Buffer, rl)
+	// sliding window prune
 	s.pruneOldLogs()
 
+	s.Buffer = append(s.Buffer, parsed[0])
 	s.logsInWindow++
 	s.Stats.TotalLogsIngested++
 
+	// Check if this specific log is an error
 	isError := false
-	if s.Config.ErrorTriggersImmediate && rl.Level == "ERROR" {
-		isError = true
+	if s.Config.ErrorTriggersImmediate {
+		if lvl, ok := logDict["level"].(string); ok && lvl == "ERROR" {
+			isError = true
+		}
 	}
 
 	return true, isError
@@ -235,11 +236,8 @@ func (s *StreamManager) backgroundFlushLoop() {
 			// Check for expiration first
 			if s.IsExpired() {
 				s.FlushWithReason(FlushExpired)
-
-				// 🔁 reset stream window (do NOT stop manager)
-				s.resetStreamWindow()
-
-				continue
+				// You might want to shut down or signal the manager is done here
+				return
 			}
 			if time.Since(s.lastFlushTime).Seconds() >= float64(s.Config.FlushIntervalSeconds) {
 				s.FlushWithReason(FlushTimeElapsed)
@@ -260,25 +258,9 @@ func (s *StreamManager) FlushWithReason(reason FlushReason) *CorrelationBundle {
 		return nil
 	}
 
-	internalPatterns := deriveInternalPatterns(s.Buffer)
-	bundle := s.Preprocessor.Factory.CreateBundle(s.Buffer, internalPatterns)
+	patterns := deriveStreamPatterns(s.Buffer)
+	bundle := s.Preprocessor.Factory.CreateBundle(s.Buffer, patterns)
 
-	// ---------------- NEW: build API response bundle ----------------
-	respBundle := &StreamBundleResponse{
-		ID:               generateIncidentID(s.Buffer),
-		WindowStart:      s.Buffer[0].Timestamp.UTC().Format(time.RFC3339),
-		WindowEnd:        s.Buffer[len(s.Buffer)-1].Timestamp.UTC().Format(time.RFC3339),
-		RootService:      firstNonEmpty(uniqueServices(s.Buffer)),
-		AffectedServices: uniqueServices(s.Buffer),
-		LogPatterns:      deriveStreamPatterns(s.Buffer),
-		FlushMetadata: StreamFlushMetadata{
-			Reason:     string(reason),
-			LogCount:   len(s.Buffer),
-			FlushedAt: time.Now().UTC().Format(time.RFC3339),
-		},
-	}
-
-	bundle.Metadata["api_bundle"] = respBundle
 	bundle.Metadata["flush_reason"] = string(reason)
 	bundle.Metadata["flushed_at"] = time.Now().UTC().Format(time.RFC3339)
 
@@ -343,107 +325,18 @@ func (s *StreamManager) publish(bundle *CorrelationBundle) {
 // ===================== PATTERN DERIVATION =====================
 //
 
-func deriveStreamPatterns(logs []RawLog) []StreamLogPattern {
-	type agg struct {
-		count int
-		first time.Time
-		last  time.Time
-		level string
-		src   map[string]string
-	}
-
-	m := make(map[string]*agg)
-
-	for _, l := range logs {
-		msg, _ := l.Data["message"].(string)
-		if msg == "" {
-			continue
-		}
-
-		src := map[string]string{}
-		if srcRaw, ok := l.Data["source"].(map[string]interface{}); ok {
-			if c, ok := srcRaw["container"].(string); ok && c != "" {
-				src["container"] = c
-			}
-			if n, ok := srcRaw["namespace"].(string); ok && n != "" {
-				src["namespace"] = n
-			}
-		}
-
-		if _, ok := m[msg]; !ok {
-			m[msg] = &agg{
-				count: 1,
-				first: l.Timestamp,
-				last:  l.Timestamp,
-				level: l.Level,
-				src:   src,
-			}
-		} else {
-			m[msg].count++
-			m[msg].last = l.Timestamp
-		}
-	}
-
-	var out []StreamLogPattern
-	for p, a := range m {
-		out = append(out, StreamLogPattern{
-			Pattern:         normalizePattern(p),
-			Count:           a.count,
-			FirstOccurrence: a.first.UTC().Format(time.RFC3339),
-			LastOccurrence:  a.last.UTC().Format(time.RFC3339),
-			ErrorClass:      a.level,
-			LogSource:       a.src,
-		})
-	}
-
-	return out
-}
-
-func deriveInternalPatterns(logs []RawLog) []string {
+func deriveStreamPatterns(logs []RawLog) []string {
 	unique := make(map[string]struct{})
-	for _, l := range logs {
-		if msg, ok := l.Data["message"].(string); ok && msg != "" {
+
+	for _, rl := range logs {
+		if msg, ok := rl.Data["message"].(string); ok && msg != "" {
 			unique[msg] = struct{}{}
 		}
 	}
-	var out []string
-	for k := range unique {
-		out = append(out, k)
+
+	var patterns []string
+	for msg := range unique {
+		patterns = append(patterns, msg)
 	}
-	return out
-}
-
-func generateIncidentID(logs []RawLog) string {
-	if len(logs) == 0 {
-		return ""
-	}
-	ts := logs[len(logs)-1].Timestamp.UTC().Format("20060102_150405")
-	return "incident_" + ts
-}
-
-func uniqueServices(logs []RawLog) []string {
-	seen := make(map[string]struct{})
-	var out []string
-	for _, l := range logs {
-		if l.Service == "" {
-			continue
-		}
-		if _, ok := seen[l.Service]; !ok {
-			seen[l.Service] = struct{}{}
-			out = append(out, l.Service)
-		}
-	}
-	return out
-}
-
-func normalizePattern(s string) string {
-	re := regexp.MustCompile(`\d+`)
-	return re.ReplaceAllString(s, "<NUM>")
-}
-
-func (s *StreamManager) resetStreamWindow() {
-    s.Stats.StartTime = time.Now()
-    s.checkWindowStart = time.Now()
-    s.logsInWindow = 0
-    s.lastFlushTime = time.Now()
+	return patterns
 }

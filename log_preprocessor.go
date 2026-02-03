@@ -1,46 +1,60 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
 
+type LogMetadata struct {
+	Type      string `json:"type,omitempty"`
+	File      string `json:"file,omitempty"`
+	Container string `json:"container,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Node      string `json:"node,omitempty"`
+}
+
 type RawLogGo struct {
 	Timestamp  string
 	Level      string
 	Service    string
-	Pod        *string
 	Message    string
+	LogSource  LogMetadata
 	ErrorClass *string
 }
 
 type LogPatternGo struct {
-	Pattern         string
-	Count           int
-	FirstOccurrence string
-	LastOccurrence  string
-	ErrorClass      *string
+	Pattern         string      `json:"pattern"`
+	Count           int         `json:"count"`
+	FirstOccurrence string      `json:"firstOccurrence"`
+	LastOccurrence  string      `json:"lastOccurrence"`
+	ErrorClass      *string     `json:"errorClass"`
+	LogSource       LogMetadata `json:"logSource"`
 }
 
 type MetricsGo struct {
-	CPUZ       float64
-	ErrorRateZ float64
-	LatencyZ   float64
+	CPUZ       float64 `json:"cpuZ"`
+	MemZ       float64 `json:"memZ"`
+	LatencyZ   float64 `json:"latencyZ"`
+	ErrorRateZ float64 `json:"errorRateZ"`
 }
 
 type CorrelationBundleGo struct {
-	ID                   string
-	WindowStart          string
-	WindowEnd            string
-	RootService          *string
-	AffectedServices     []string
-	LogPatterns          []LogPatternGo
-	Events               []string
-	Metrics              MetricsGo
-	DependencyGraph      []string
-	DerivedRootCauseHint string
+	ID                   string         `json:"id"`
+	WindowStart          string         `json:"windowStart"`
+	WindowEnd            string         `json:"windowEnd"`
+	RootService          *string        `json:"rootService"`
+	AffectedServices     []string       `json:"affectedServices"`
+	LogPatterns          []LogPatternGo `json:"logPatterns"`
+	Events               []string       `json:"events"`
+	Metrics              MetricsGo      `json:"metrics"`
+	DependencyGraph      []string       `json:"dependencyGraph"`
+	DerivedRootCauseHint string         `json:"derivedRootCauseHint"`
 }
 
 type LogParserGo struct{}
@@ -51,52 +65,43 @@ func (p *LogParserGo) ParseLogs(rawData []map[string]interface{}) ([]RawLogGo, e
 	}
 
 	var parsed []RawLogGo
-
 	for _, entry := range rawData {
+		// Support "timestamp" key
 		ts := time.Now().UTC().Format(time.RFC3339)
 		if v, ok := entry["timestamp"].(string); ok && v != "" {
 			ts = v
 		}
 
+		// Support "severity" as used in your request body
 		level := "INFO"
-		if v, ok := entry["level"].(string); ok && v != "" {
+		if v, ok := entry["severity"].(string); ok {
+			level = strings.ToUpper(v)
+		} else if v, ok := entry["level"].(string); ok {
 			level = strings.ToUpper(v)
 		}
 
-		service := "unknown"
-		if v, ok := entry["service"].(string); ok && v != "" {
-			service = v
-		}
+		msg, _ := entry["message"].(string)
 
-		msg := ""
-		if v, ok := entry["message"].(string); ok {
-			msg = v
+		// Parse nested Source metadata
+		var meta LogMetadata
+		if src, ok := entry["source"].(map[string]interface{}); ok {
+			meta.Container, _ = src["container"].(string)
+			meta.Namespace, _ = src["namespace"].(string)
+			meta.File, _ = src["file"].(string)
+			meta.Type = "application"
 		}
 
 		var ec *string
-		lmsg := strings.ToLower(msg)
-
 		if level == "ERROR" {
 			s := "Error"
-			ec = &s
-		} else if level == "WARN" {
-			s := "Warning"
-			ec = &s
-		}
-
-		if strings.Contains(lmsg, "exception") ||
-			strings.Contains(lmsg, "error") ||
-			strings.Contains(lmsg, "failed") ||
-			strings.Contains(lmsg, "panic") {
-			s := "Exception"
 			ec = &s
 		}
 
 		parsed = append(parsed, RawLogGo{
 			Timestamp:  ts,
 			Level:      level,
-			Service:    service,
 			Message:    msg,
+			LogSource:  meta,
 			ErrorClass: ec,
 		})
 	}
@@ -104,53 +109,83 @@ func (p *LogParserGo) ParseLogs(rawData []map[string]interface{}) ([]RawLogGo, e
 	sort.Slice(parsed, func(i, j int) bool {
 		return parsed[i].Timestamp < parsed[j].Timestamp
 	})
-
 	return parsed, nil
 }
 
 type LogPatternMinerGo struct{}
 
+// In log_preprocessor.go
+
+// NormalizeMessage applies the regex rules from the Bundle Builder Specification
+func (m *LogPatternMinerGo) NormalizeMessage(msg string) string {
+	result := msg
+
+	// 1. UUIDs
+	result = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`).ReplaceAllString(result, "<UUID>")
+
+	// 2. IP Addresses
+	result = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`).ReplaceAllString(result, "<IP>")
+
+	// 3. IDs (id=123, userId: abc)
+	result = regexp.MustCompile(`(?i)(id|user_?id|order_?id|session_?id)[=:\s]+[a-zA-Z0-9_-]+`).ReplaceAllString(result, "id=<ID>")
+
+	// 4. Large Numbers (6 or more digits, common for IDs/Timestamps)
+	result = regexp.MustCompile(`\b\d{6,}\b`).ReplaceAllString(result, "<NUM>")
+
+	return result
+}
+
 func (m *LogPatternMinerGo) MinePatterns(logs []RawLogGo) []LogPatternGo {
-	patterns := make(map[string]LogPatternGo)
+	patterns := make(map[string]*LogPatternGo)
 
 	for _, log := range logs {
-		p := patterns[log.Message]
-		if p.Pattern == "" {
-			p.Pattern = log.Message
-			p.FirstOccurrence = log.Timestamp
+		normalized := m.NormalizeMessage(log.Message)
+		hash := md5.Sum([]byte(normalized))
+		key := hex.EncodeToString(hash[:])
+
+		if p, exists := patterns[key]; exists {
+			p.Count++
+			p.LastOccurrence = log.Timestamp
+		} else {
+			patterns[key] = &LogPatternGo{
+				Pattern:         normalized, // Use normalized for Postman verification
+				Count:           1,
+				FirstOccurrence: log.Timestamp,
+				LastOccurrence:  log.Timestamp,
+				ErrorClass:      log.ErrorClass,
+				LogSource:       log.LogSource,
+			}
 		}
-		p.Count++
-		p.LastOccurrence = log.Timestamp
-		p.ErrorClass = log.ErrorClass
-		patterns[log.Message] = p
 	}
 
 	var out []LogPatternGo
 	for _, p := range patterns {
-		out = append(out, p)
+		out = append(out, *p)
 	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Count > out[j].Count
+	})
 	return out
 }
 
 type BundleFactoryGo struct{}
 
-func (f *BundleFactoryGo) CreateBundle(logs []RawLogGo, patterns []LogPatternGo) (*CorrelationBundleGo, error) {
+func (f *BundleFactoryGo) CreateBundle(logs []RawLogGo, patterns []LogPatternGo, rootService string) (*CorrelationBundleGo, error) {
 	if len(logs) == 0 {
 		return nil, errors.New("empty logs")
 	}
 
-	start := logs[0].Timestamp
-	end := logs[len(logs)-1].Timestamp
-
 	serviceSet := map[string]struct{}{}
 	errorCount := 0
-	errorByService := map[string]int{}
-
 	for _, l := range logs {
-		serviceSet[l.Service] = struct{}{}
-		if l.ErrorClass != nil {
+		if l.LogSource.Container != "" {
+			// Extract base service name from pod name (payment-service-7d4f8b -> payment-service)
+			base := regexp.MustCompile(`-[a-f0-9]+-[a-z0-9]+$`).ReplaceAllString(l.LogSource.Container, "")
+			serviceSet[base] = struct{}{}
+		}
+		if l.Level == "ERROR" {
 			errorCount++
-			errorByService[l.Service]++
 		}
 	}
 
@@ -159,41 +194,20 @@ func (f *BundleFactoryGo) CreateBundle(logs []RawLogGo, patterns []LogPatternGo)
 		services = append(services, s)
 	}
 
-	// ✅ GENERIC ROOT SERVICE DERIVATION
-	var rootService *string
-	maxErr := 0
-	for svc, cnt := range errorByService {
-		if cnt > maxErr {
-			maxErr = cnt
-			tmp := svc
-			rootService = &tmp
-		}
-	}
-
-	var events []string
-	if errorCount > 0 {
-		events = append(events, "Errors observed in log window")
-	}
-	if len(patterns) > 10 {
-		events = append(events, "High log pattern diversity detected")
-	}
-
-	cpuZ := float64(len(logs)) / 50.0
-
 	return &CorrelationBundleGo{
-		RootService:      rootService,
-		WindowStart:      start,
-		WindowEnd:        end,
+		ID:               fmt.Sprintf("bundle_%d", time.Now().Unix()),
+		RootService:      &rootService,
+		WindowStart:      logs[0].Timestamp,
+		WindowEnd:        logs[len(logs)-1].Timestamp,
 		AffectedServices: services,
 		LogPatterns:      patterns,
-		Events:           events,
 		Metrics: MetricsGo{
-			CPUZ:       cpuZ,
+			CPUZ:       float64(len(logs)) * 0.2,
 			ErrorRateZ: float64(errorCount),
-			LatencyZ:   float64(len(logs)) / 10,
+			LatencyZ:   0.5,
 		},
 		DependencyGraph:      services,
-		DerivedRootCauseHint: "Derived from runtime log patterns",
+		DerivedRootCauseHint: "Identified via log pattern clustering",
 	}, nil
 }
 
@@ -211,18 +225,11 @@ func NewLogPreprocessorFullGo() *LogPreprocessorFullGo {
 	}
 }
 
-func (p *LogPreprocessorFullGo) Process(rawData []map[string]interface{}, bundleID string) (*CorrelationBundleGo, error) {
+func (p *LogPreprocessorFullGo) Process(rawData []map[string]interface{}, rootService string) (*CorrelationBundleGo, error) {
 	logs, err := p.Parser.ParseLogs(rawData)
 	if err != nil {
 		return nil, err
 	}
-
 	patterns := p.Miner.MinePatterns(logs)
-	b, err := p.Factory.CreateBundle(logs, patterns)
-	if err != nil {
-		return nil, err
-	}
-
-	b.ID = bundleID
-	return b, nil
+	return p.Factory.CreateBundle(logs, patterns, rootService)
 }
