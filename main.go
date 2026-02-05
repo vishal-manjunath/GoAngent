@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"unicode/utf16"
 
 	"gopkg.in/yaml.v3"
+	"opscure.com/extension_agent/pkg/gitcontext"
 )
 
 //
@@ -963,20 +965,6 @@ type AnalyzeResponse struct {
 	TopK   int           `json:"top_k"`
 }
 
-type AnalyzeBundle struct {
-	ID                   string              `json:"id"`
-	WindowStart          string              `json:"windowStart"`
-	WindowEnd            string              `json:"windowEnd"`
-	RootService          string              `json:"rootService"`
-	AffectedServices     []string            `json:"affectedServices"`
-	LogPatterns          []AnalyzeLogPattern `json:"logPatterns"`
-	Events               []AnalyzeEvent      `json:"events"`
-	Metrics              AnalyzeMetrics      `json:"metrics"`
-	DependencyGraph      []string            `json:"dependencyGraph"`
-	DerivedRootCauseHint string              `json:"derivedRootCauseHint"`
-	GitConfig            interface{}         `json:"git_config,omitempty"`
-}
-
 type AnalyzeLogPattern struct {
 	Pattern         string  `json:"pattern"`
 	Count           int     `json:"count"`
@@ -993,10 +981,45 @@ type AnalyzeEvent struct {
 	Timestamp string `json:"timestamp"`
 }
 
+// Inside main.go
+
 type AnalyzeMetrics struct {
 	CPUZ       float64 `json:"cpuZ"`
+	MemZ       float64 `json:"memZ"` // Added this
 	LatencyZ   float64 `json:"latencyZ"`
 	ErrorRateZ float64 `json:"errorRateZ"`
+}
+
+type GitCommit struct {
+	SHA       string `json:"sha"`
+	Message   string `json:"message"`
+	Author    string `json:"author"`
+	Timestamp string `json:"timestamp"`
+}
+
+type GitContext struct {
+	RepoURL       string      `json:"repo_url"`
+	Branch        string      `json:"branch"`
+	RecentCommits []GitCommit `json:"recent_commits"`
+	ChangedFiles  []string    `json:"changed_files"`
+	Diff          string      `json:"diff"`
+}
+
+// Update AnalyzeBundle to include GitContext
+type AnalyzeBundle struct {
+	ID                   string                 `json:"id"`
+	WindowStart          string                 `json:"windowStart"`
+	WindowEnd            string                 `json:"windowEnd"`
+	RootService          string                 `json:"rootService"`
+	AffectedServices     []string               `json:"affectedServices"`
+	LogPatterns          []AnalyzeLogPattern    `json:"logPatterns"`
+	Events               []AnalyzeEvent         `json:"events"`
+	Metrics              AnalyzeMetrics         `json:"metrics"`
+	DependencyGraph      []string               `json:"dependencyGraph"`
+	DerivedRootCauseHint string                 `json:"derivedRootCauseHint"`
+	GitContext           *gitcontext.GitContext `json:"git_context,omitempty"`
+	GitConfig            gitcontext.GitConfig   `json:"git_config"`
+	FlushMetadata        interface{}            `json:"flush_metadata,omitempty"`
 }
 
 type PreprocessCombinedResponse struct {
@@ -1049,6 +1072,56 @@ func firstNonEmpty(list []string) string {
 // ================= PREPROCESS HANDLER (FIXED DYNAMICALLY) =================
 //
 
+type FinalFlatResponse struct {
+	Bundle AnalyzeBundle `json:"bundle"`
+	UseRag bool          `json:"use_rag"`
+	TopK   int           `json:"top_k"`
+	// This captures the AI analysis fields directly
+	Recommendation json.RawMessage `json:"recommendation,omitempty"`
+}
+
+func GetGitContext(repoPath string) (*GitContext, error) {
+	if repoPath == "" {
+		return nil, errors.New("no repo path provided")
+	}
+
+	// 1. Get Remote URL
+	urlCmd := exec.Command("git", "-C", repoPath, "remote", "get-url", "origin")
+	urlOut, _ := urlCmd.Output()
+
+	// 2. Get Current Branch
+	branchCmd := exec.Command("git", "-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD")
+	branchOut, _ := branchCmd.Output()
+
+	// 3. Get Recent Commits (Formatted for easy parsing)
+	// %h=hash, %s=subject, %an=author name, %aI=author date (strict ISO 8601)
+	logFormat := "%h|%s|%an|%aI"
+	logCmd := exec.Command("git", "-C", repoPath, "log", "-n", "5", "--pretty=format:"+logFormat)
+	logOut, _ := logCmd.Output()
+
+	commits := []GitCommit{}
+	lines := strings.Split(string(logOut), "\n")
+	for _, line := range lines {
+		parts := strings.Split(line, "|")
+		if len(parts) == 4 {
+			commits = append(commits, GitCommit{
+				SHA:       parts[0],
+				Message:   parts[1],
+				Author:    parts[2],
+				Timestamp: parts[3],
+			})
+		}
+	}
+
+	return &GitContext{
+		RepoURL:       strings.TrimSpace(string(urlOut)),
+		Branch:        strings.TrimSpace(string(branchOut)),
+		RecentCommits: commits,
+		// ChangedFiles:  []string{}, // Keep empty as requested
+		// Diff:          "",         // Keep empty as requested
+	}, nil
+}
+
 func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -1071,14 +1144,14 @@ func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var gitConfig interface{}
 	var rawData []map[string]interface{}
+	//var gitConfig interface{} // Keep this declaration
 	inputBundleID := "detected-root"
 
 	if bundle, ok := payload["bundle"].(map[string]interface{}); ok {
-		if gc, ok := bundle["git_config"]; ok {
-			gitConfig = gc
-		}
+		// if gc, ok := bundle["git_config"]; ok {
+		// 	gitConfig = gc
+		// }
 		if id, ok := bundle["id"].(string); ok {
 			inputBundleID = id
 		}
@@ -1145,6 +1218,35 @@ func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 		rootSvc = *bundle.RootService
 	}
 
+	// dummyGitContext := &GitContext{
+	// 	RepoURL: "https://github.com/company/checkout-service",
+	// 	Branch:  "main",
+	// 	RecentCommits: []GitCommit{
+	// 		{
+	// 			SHA:       "a1b2c3d",
+	// 			Message:   "Update database pool settings",
+	// 			Author:    "dev@company.com",
+	// 			Timestamp: "2026-02-02T22:40:00Z",
+	// 		},
+	// 	},
+	// 	ChangedFiles: []string{
+	// 		"src/main/resources/application.yml",
+	// 		"src/main/java/com/checkout/DatabaseConfig.java",
+	// 	},
+	// 	Diff: "diff --git a/application.yml\n-  maxPoolSize: 100\n+  maxPoolSize: 20",
+	// }
+
+	//repoPath := os.Getenv("/desktop/GoAngent") + "/" + rootSvc
+
+	repoPath := "/tmp/opscure-test-repo"
+
+	gitPayload, err := gitcontext.Extract(repoPath)
+	if err != nil {
+		fmt.Printf("Git extraction failed for %s: %v\n", rootSvc, err)
+		// Optionally initialize empty payload if extraction fails
+		gitPayload = &gitcontext.GitContextPayload{}
+	}
+
 	preprocessResponse := AnalyzeResponse{
 		Bundle: AnalyzeBundle{
 			ID:               bundle.ID,
@@ -1156,36 +1258,53 @@ func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 			Events:           events,
 			Metrics: AnalyzeMetrics{
 				CPUZ:       bundle.Metrics.CPUZ,
+				MemZ:       0.0, // Now this works
 				LatencyZ:   bundle.Metrics.LatencyZ,
 				ErrorRateZ: bundle.Metrics.ErrorRateZ,
 			},
 			DependencyGraph:      bundle.DependencyGraph,
 			DerivedRootCauseHint: bundle.DerivedRootCauseHint,
-			GitConfig:            gitConfig,
+
+			// FIX: Assign the gitConfig variable so it is "used"
+			//GitConfig: gitConfig,
+			GitContext: &gitPayload.GitContext,
+			GitConfig:  gitPayload.GitConfig,
+
+			// FIX: This now works because we added the field to the struct
+			FlushMetadata: map[string]interface{}{
+				"reason":     "error_detected",
+				"log_count":  len(rawData),
+				"flushed_at": time.Now().UTC().Format(time.RFC3339),
+			},
 		},
 		UseRag: true,
 		TopK:   5,
 	}
 
-	var analyzeRespRaw json.RawMessage
+	// 2. Call the AI Analyze Service
 	reqBody, _ := json.Marshal(preprocessResponse)
 	req, _ := http.NewRequest(http.MethodPost, "http://18.191.159.155:8000/ai/analyze", strings.NewReader(string(reqBody)))
 	req.Header.Set("Content-Type", "application/json")
+
 	client := &http.Client{Timeout: 2 * time.Minute}
 	resp, err := client.Do(req)
-	if err != nil {
-		errObj := map[string]string{"error": fmt.Sprintf("analyze request failed: %s", err.Error())}
-		b, _ := json.Marshal(errObj)
-		analyzeRespRaw = json.RawMessage(b)
-	} else {
+
+	var aiRecommendation json.RawMessage
+	if err == nil {
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		analyzeRespRaw = json.RawMessage(body)
+		var fullAiResp map[string]json.RawMessage
+		json.NewDecoder(resp.Body).Decode(&fullAiResp)
+		// Extract only the recommendation part to flatten it
+		aiRecommendation = fullAiResp["recommendation"]
 	}
 
-	finalResponse := PreprocessCombinedResponse{
-		PreprocessResponse: preprocessResponse,
-		AnalyzeResponse:    analyzeRespRaw,
+	// 3. BUILD THE FLATTENED RESPONSE
+	// Instead of nesting under "preprocess_response", we put bundle at the root
+	finalResponse := map[string]interface{}{
+		"bundle":         preprocessResponse.Bundle,
+		"use_rag":        preprocessResponse.UseRag,
+		"top_k":          preprocessResponse.TopK,
+		"recommendation": aiRecommendation,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
